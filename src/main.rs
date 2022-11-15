@@ -2,8 +2,8 @@ use std::{collections::HashSet, fs};
 
 use libp2p::{
     core::upgrade,
-    floodsub::{Floodsub, FloodsubEvent, Topic},
     futures::StreamExt,
+    gossipsub::{Gossipsub, GossipsubConfig, GossipsubEvent, IdentTopic, MessageAuthenticity},
     identity,
     mdns::{Mdns, MdnsEvent},
     mplex::MplexConfig,
@@ -23,7 +23,7 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync 
 
 static KEYS: Lazy<identity::Keypair> = Lazy::new(|| identity::Keypair::generate_ed25519());
 static PEER_ID: Lazy<PeerId> = Lazy::new(|| PeerId::from(KEYS.public()));
-static TOPIC: Lazy<Topic> = Lazy::new(|| Topic::new("recipes"));
+static TOPIC: Lazy<IdentTopic> = Lazy::new(|| IdentTopic::new("recipes"));
 
 type Recipes = Vec<Recipe>;
 
@@ -61,7 +61,7 @@ enum EventType {
 
 #[derive(NetworkBehaviour)]
 struct RecipeBehaviour {
-    floodsub: Floodsub,
+    gossipsub: Gossipsub,
     mdns: Mdns,
     #[behaviour(ignore)]
     response_sender: mpsc::UnboundedSender<ListResponse>,
@@ -72,42 +72,47 @@ impl NetworkBehaviourEventProcess<MdnsEvent> for RecipeBehaviour {
         match event {
             MdnsEvent::Discovered(discovered_list) => {
                 for (peer, _addr) in discovered_list {
-                    self.floodsub.add_node_to_partial_view(peer);
+                    self.gossipsub.add_explicit_peer(&peer);
                 }
             }
             MdnsEvent::Expired(expired_list) => {
                 for (peer, _addr) in expired_list {
-                    self.floodsub.remove_node_from_partial_view(&peer);
+                    self.gossipsub.remove_explicit_peer(&peer);
                 }
             }
         }
     }
 }
 
-impl NetworkBehaviourEventProcess<FloodsubEvent> for RecipeBehaviour {
-    fn inject_event(&mut self, event: FloodsubEvent) {
+impl NetworkBehaviourEventProcess<GossipsubEvent> for RecipeBehaviour {
+    fn inject_event(&mut self, event: GossipsubEvent) {
         match event {
-            FloodsubEvent::Message(msg) => {
-                if let Ok(resp) = serde_json::from_slice::<ListResponse>(&msg.data) {
+            GossipsubEvent::Message {
+                message_id: _,
+                propagation_source: _,
+                message,
+            } => {
+                let source = message.source.expect("Message has a source");
+                if let Ok(resp) = serde_json::from_slice::<ListResponse>(&message.data) {
                     if resp.receiver == PEER_ID.to_string() {
-                        info!("Response from {}:", msg.source);
+                        info!("Response from {}:", source);
                         resp.data.iter().for_each(|r| info!("{:?}", r));
                     }
-                } else if let Ok(req) = serde_json::from_slice::<ListRequest>(&msg.data) {
+                } else if let Ok(req) = serde_json::from_slice::<ListRequest>(&message.data) {
                     match req.mode {
                         ListMode::ALL => {
-                            info!("Received ALL req: {:?} from {:?}", req, msg.source);
+                            info!("Received ALL req: {:?} from {:?}", req, message.source);
                             respond_with_public_recipes(
                                 self.response_sender.clone(),
-                                msg.source.to_string(),
+                                source.to_string(),
                             );
                         }
                         ListMode::One(ref peer_id) => {
                             if peer_id == &PEER_ID.to_string() {
-                                info!("Received req: {:?} from {:?}", req, msg.source);
+                                info!("Received req: {:?} from {:?}", req, message.source);
                                 respond_with_public_recipes(
                                     self.response_sender.clone(),
-                                    msg.source.to_string(),
+                                    source.to_string(),
                                 );
                             }
                         }
@@ -144,25 +149,31 @@ async fn main() {
     info!("Peer Id: {}", *PEER_ID);
     let (response_sender, mut response_rcv) = mpsc::unbounded_channel::<ListResponse>();
 
-    let auth_keys: AuthenticKeypair<X25519Spec> = Keypair::<X25519Spec>::new()
+    let noise_keys: AuthenticKeypair<X25519Spec> = Keypair::<X25519Spec>::new()
         .into_authentic(&KEYS)
         .expect("Can create auth keys");
 
     let transp = TokioTcpConfig::new()
         .upgrade(upgrade::Version::V1)
-        .authenticate(NoiseConfig::xx(auth_keys).into_authenticated())
+        .authenticate(NoiseConfig::xx(noise_keys).into_authenticated())
         .multiplex(MplexConfig::new())
         .boxed();
 
+    let message_authenticity = MessageAuthenticity::Signed(KEYS.clone());
+
     let mut behaviour = RecipeBehaviour {
-        floodsub: Floodsub::new(PEER_ID.clone()),
+        gossipsub: Gossipsub::new(message_authenticity, GossipsubConfig::default())
+            .expect("Can create gossipsub"),
         mdns: Mdns::new(Default::default())
             .await
             .expect("can create mdns"),
         response_sender,
     };
 
-    behaviour.floodsub.subscribe(TOPIC.clone());
+    behaviour
+        .gossipsub
+        .subscribe(&TOPIC)
+        .expect("Can subscribe to topic");
 
     let mut swarm = SwarmBuilder::new(transp, behaviour, *PEER_ID)
         .executor(Box::new(|fut| {
@@ -195,8 +206,9 @@ async fn main() {
                     let json = serde_json::to_string(&resp).expect("can jsonify response");
                     swarm
                         .behaviour_mut()
-                        .floodsub
-                        .publish(TOPIC.clone(), json.as_bytes());
+                        .gossipsub
+                        .publish(TOPIC.clone(), json.as_bytes())
+                        .expect("Can publish");
                 }
                 EventType::Input(line) => match line.as_str() {
                     "ls p" => handle_list_peers(&mut swarm).await,
@@ -261,8 +273,9 @@ async fn handle_list_recipes(cmd: &str, swarm: &mut Swarm<RecipeBehaviour>) {
             let json = serde_json::to_string(&req).expect("Can jsonify request");
             swarm
                 .behaviour_mut()
-                .floodsub
-                .publish(TOPIC.clone(), json.as_bytes());
+                .gossipsub
+                .publish(TOPIC.clone(), json.as_bytes())
+                .expect("Can publish");
         }
         Some(recipes_peer_id) => {
             let req = ListRequest {
@@ -271,8 +284,9 @@ async fn handle_list_recipes(cmd: &str, swarm: &mut Swarm<RecipeBehaviour>) {
             let json = serde_json::to_string(&req).expect("can jsonify request");
             swarm
                 .behaviour_mut()
-                .floodsub
-                .publish(TOPIC.clone(), json.as_bytes());
+                .gossipsub
+                .publish(TOPIC.clone(), json.as_bytes())
+                .expect("Can publish");
         }
         None => match read_local_recipes().await {
             Ok(v) => {
