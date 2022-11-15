@@ -17,7 +17,7 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use tokio::{io::AsyncBufReadExt, sync::mpsc};
 
-const STORAGE_FILE_PATH: &str = "./recipies.json";
+const STORAGE_FILE_PATH: &str = "./recipes.json";
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync + 'static>>;
 
@@ -183,7 +183,7 @@ async fn main() {
             tokio::select! {
                 line = stdin.next_line() => Some(EventType::Input(line.expect("can get line").expect("can read line from stdin"))),
                 event = swarm.select_next_some() => {
-                    info!("Unhandled Swarm Event: {:?}", event);
+                    //info!("Unhandled Swarm Event: {:?}", event);
                     None
                 },
                 response = response_rcv.recv() => Some(EventType::Response(response.expect("response exists"))),
@@ -191,8 +191,12 @@ async fn main() {
         };
         if let Some(event) = evt {
             match event {
-                EventType::Response(_resp) => {
-                    // ...
+                EventType::Response(resp) => {
+                    let json = serde_json::to_string(&resp).expect("can jsonify response");
+                    swarm
+                        .behaviour_mut()
+                        .floodsub
+                        .publish(TOPIC.clone(), json.as_bytes());
                 }
                 EventType::Input(line) => match line.as_str() {
                     "ls p" => handle_list_peers(&mut swarm).await,
